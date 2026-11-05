@@ -1,0 +1,187 @@
+---
+# Furnish a Windows Server desktop over the aws_ssm connection plugin.
+#
+#   ansible-galaxy collection install -r requirements.yml -p ./.collections
+#   ansible-playbook -i inventory.aws_ec2.yml furnish.yml
+#
+# Idempotent. Safe to re-run. Read ../docs/probe-first.md before you debug it, and
+# ../docs/traps.md for why the tasks below look the way they do.
+- name: Furnish a Windows desktop
+  hosts: desktops
+  gather_facts: false
+
+  vars:
+    # NetBIOS names are 15 characters at most; a longer one is silently truncated.
+    computer_name: desk-01
+
+    # One package per task, on purpose. See docs/traps.md.
+    choco_packages:
+      - docker-desktop
+      - git.portable
+
+    # Join a tailnet (Tailscale or Headscale). Off by default.
+    tailnet_enabled: false
+    tailnet_login_server: ''            # exactly as the control plane spells it
+    tailnet_authkey_ssm_path: ''        # SecureString holding a pre-auth key
+    tailnet_hostname: "{{ computer_name }}"
+    tailnet_region: us-east-1
+
+    # Idle stop. Dry run until armed. busy_check is a command printing how many units of
+    # work are in flight; see files/idle-stop.ps1.
+    idle_stop_enabled: true
+    idle_stop_armed: false
+    idle_stop_user: SYSTEM              # use the login user if busy_check goes through wsl.exe
+    idle_stop_busy_check: 'wsl.exe -d Ubuntu -u root -- bash -lc "docker ps -q --filter label=com.docker.compose.service=lab | wc -l"'
+    idle_stop_wsl_distro: Ubuntu
+    root_dir: C:\ProgramData\vdi-furnish
+
+  tasks:
+    # Rename first: a later rename forces another reboot and another SSM reconnect.
+    - name: Set the computer name
+      ansible.windows.win_hostname:
+        name: '{{ computer_name }}'
+      register: renamed
+
+    - name: Check for a pending reboot
+      ansible.windows.win_shell: |
+        if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue) -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')) { 'REBOOT' } else { 'OK' }
+      register: reboot_check
+      changed_when: false
+
+    # win_reboot reboots correctly over aws_ssm but cannot re-detect boot time through the
+    # session the reboot just dropped, so a success reports as a timeout.
+    - name: Reboot to clear pending file operations
+      ansible.windows.win_reboot:
+        reboot_timeout: 600
+      when: "'REBOOT' in reboot_check.stdout or renamed is changed"
+      failed_when: false
+
+    - name: Wait for the machine to accept commands again
+      ansible.windows.win_shell: 'Write-Output ok'
+      register: alive
+      until: alive is succeeded
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Install packages, one at a time
+      chocolatey.chocolatey.win_chocolatey:
+        name: '{{ item }}'
+        state: present
+      loop: '{{ choco_packages }}'
+
+    # Windows Server images ship the AWS CLI, and choco's MSI exits 1603 when the same
+    # version is already present. Ask the machine first.
+    - name: Check whether the AWS CLI is present
+      ansible.windows.win_shell: 'if (Get-Command aws -ErrorAction SilentlyContinue) { "present" } else { "absent" }'
+      register: awscli_check
+      changed_when: false
+
+    - name: Install the AWS CLI
+      chocolatey.chocolatey.win_chocolatey:
+        name: awscli
+        state: present
+      when: "'absent' in awscli_check.stdout"
+
+    # netsh portproxy will not bind unless IP Helper is running. DCV refuses privileged
+    # ports, so a 443 -> 8443 proxy is what gives users a URL with no port in it.
+    - name: Start IP Helper
+      ansible.windows.win_service:
+        name: iphlpsvc
+        start_mode: auto
+        state: started
+
+    # ---- tailnet ---------------------------------------------------------------------
+
+    - name: Install Tailscale
+      chocolatey.chocolatey.win_chocolatey:
+        name: tailscale
+        state: present
+      when: tailnet_enabled | bool
+
+    # The key is read inside this PowerShell process and never becomes an ansible
+    # argument. Scrub it from the output rather than using no_log, which would hide the
+    # real failure behind "censored".
+    - name: Join the tailnet
+      ansible.windows.win_shell: |
+        $key = aws ssm get-parameter --name '{{ tailnet_authkey_ssm_path }}' `
+          --with-decryption --query Parameter.Value --output text --region {{ tailnet_region }}
+        if (-not $key) { throw 'no pre-auth key at {{ tailnet_authkey_ssm_path }}' }
+        $out = & 'C:\Program Files\Tailscale\tailscale.exe' up `
+          --login-server '{{ tailnet_login_server }}' --authkey $key `
+          --hostname '{{ tailnet_hostname }}' --unattended 2>&1
+        $code = $LASTEXITCODE
+        ($out | Out-String) -replace [regex]::Escape($key), '<key>'
+        if ($code -ne 0) { throw "tailscale up exited $code" }
+      when: tailnet_enabled | bool
+      changed_when: true
+
+    - name: Read back the tailnet state
+      ansible.windows.win_shell: |
+        & 'C:\Program Files\Tailscale\tailscale.exe' status --json |
+          ConvertFrom-Json | ForEach-Object { "$($_.Self.HostName) $($_.BackendState)" }
+      register: tailnet_state
+      changed_when: false
+      when: tailnet_enabled | bool
+
+    # With no inbound access, an unjoined machine is unreachable, not degraded.
+    - name: Stop if the machine is not on the tailnet
+      ansible.builtin.fail:
+        msg: >-
+          Not on the tailnet ({{ tailnet_state.stdout | trim }}). Check the key at
+          {{ tailnet_authkey_ssm_path }}, that the ACL knows its tag, and that no older
+          node still holds the name {{ tailnet_hostname }}.
+      when: tailnet_enabled | bool and 'Running' not in tailnet_state.stdout
+
+    # ---- idle stop -------------------------------------------------------------------
+
+    - name: Create the working directories
+      ansible.windows.win_file:
+        path: '{{ root_dir }}\logs'
+        state: directory
+      when: idle_stop_enabled | bool
+
+    - name: Place the idle-stop script
+      ansible.windows.win_copy:
+        src: files/idle-stop.ps1
+        dest: '{{ root_dir }}\idle-stop.ps1'
+      when: idle_stop_enabled | bool
+
+    - name: Arm or disarm the idle stop
+      ansible.windows.win_file:
+        path: '{{ root_dir }}\idle-stop-armed'
+        state: '{{ "touch" if idle_stop_armed else "absent" }}'
+      when: idle_stop_enabled | bool
+
+    - name: Schedule the idle-stop check every five minutes
+      community.windows.win_scheduled_task:
+        name: idle-stop
+        username: '{{ idle_stop_user }}'
+        logon_type: '{{ "service_account" if idle_stop_user == "SYSTEM" else "interactive_token" }}'
+        run_level: highest
+        actions:
+          - path: powershell.exe
+            arguments: >-
+              -NoProfile -ExecutionPolicy Bypass -File "{{ root_dir }}\idle-stop.ps1"
+              -BusyCheck '{{ idle_stop_busy_check }}' -WslDistro '{{ idle_stop_wsl_distro }}'
+        triggers:
+          - type: daily
+            start_boot: false
+            repetition:
+              interval: PT5M
+              duration: P1D
+        state: present
+        enabled: true
+      when: idle_stop_enabled | bool
+
+    - name: Report what is installed
+      ansible.windows.win_shell: |
+        "docker : " + (docker --version 2>&1)
+        "git    : " + (git --version 2>&1)
+        "aws    : " + (aws --version 2>&1)
+      register: versions
+      changed_when: false
+
+    - name: Show versions
+      ansible.builtin.debug:
+        var: versions.stdout_lines

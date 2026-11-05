@@ -1,0 +1,10 @@
+---
+collections:
+  - name: community.aws # the aws_ssm connection plugin
+    version: ">=9.0.0"
+  - name: ansible.windows
+    version: ">=2.5.0"
+  - name: community.windows # win_scheduled_task
+    version: ">=2.0.0"
+  - name: chocolatey.chocolatey
+    version: ">=1.5.0"

@@ -1,0 +1,8 @@
+---
+collections:
+  - name: community.aws # the aws_ssm connection plugin
+    version: ">=9.0.0"
+  - name: ansible.posix # mount, authorized_key
+    version: ">=1.5.0"
+  - name: community.general # filesystem
+    version: ">=9.0.0"

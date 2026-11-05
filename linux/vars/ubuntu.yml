@@ -1,0 +1,3 @@
+---
+ssh_service: ssh
+login_group: ubuntu

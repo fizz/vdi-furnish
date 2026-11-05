@@ -1,0 +1,63 @@
+---
+# Ubuntu 24.04. Docker, Compose and Buildx all come signed from the archive, which is the
+# one place Ubuntu is the stronger supply chain. The AWS CLI is not in the archive, and the
+# SSM agent is a snap that the AWS image ships.
+- name: Install the base packages
+  ansible.builtin.apt:
+    name:
+      - docker.io
+      - docker-compose-v2
+      - docker-buildx
+      - git
+      - jq
+      - bc
+      - curl
+      - unzip
+      - tmux
+      - ca-certificates
+      - python3-debian
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Check whether the AWS CLI is present
+  ansible.builtin.command: which aws
+  register: awscli_check
+  changed_when: false
+  failed_when: false
+
+- name: Install the AWS CLI
+  ansible.builtin.shell: |
+    set -e
+    d=$(mktemp -d)
+    curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o "$d/awscli.zip"
+    unzip -q "$d/awscli.zip" -d "$d"
+    "$d/aws/install" --update
+    rm -rf "$d"
+  when: awscli_check.rc != 0
+
+# Tailscale's signed repository, not the install script.
+- name: Add the Tailscale repository
+  ansible.builtin.deb822_repository:
+    name: tailscale
+    types: [deb]
+    uris: https://pkgs.tailscale.com/stable/ubuntu
+    suites: [noble]
+    components: [main]
+    signed_by: https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg
+    state: present
+  when: tailnet_enabled | bool
+
+- name: Install Tailscale
+  ansible.builtin.apt:
+    name: tailscale
+    state: present
+    update_cache: true
+  when: tailnet_enabled | bool
+
+- name: Run the Tailscale daemon
+  ansible.builtin.systemd:
+    name: tailscaled
+    state: started
+    enabled: true
+  when: tailnet_enabled | bool

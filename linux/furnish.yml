@@ -1,0 +1,288 @@
+---
+# Furnish a Linux developer workspace over the aws_ssm connection plugin: a data volume,
+# Docker, named accounts keyed from GitHub, an optional tailnet join, and an idle stop. No
+# inbound SSH is needed to run it.
+#
+# Either Amazon Linux 2023 or Ubuntu 24.04. The OS is read from /etc/os-release, so the
+# same playbook furnishes either. Force one with -e linux_os=al2023 or -e linux_os=ubuntu.
+# Only what genuinely differs lives in vars/<os>.yml and tasks/<os>.yml: package names,
+# Docker's plugins, the Tailscale repository, the SSH unit and the login group.
+#
+#   ansible-galaxy collection install -r requirements.yml -p ./.collections
+#   ansible-playbook -i inventory.aws_ec2.yml furnish.yml
+#
+# Idempotent. Safe to re-run. See ../docs/traps.md for why the tasks look the way they do.
+- name: Furnish a Linux workspace
+  hosts: workspaces
+  gather_facts: false
+  become: true
+
+  vars:
+    hostname: workspace-01
+
+    # Attach a second volume of exactly this many bytes (200 GiB shown). The NVMe device
+    # name is not stable across boots, so the volume is found by size.
+    data_volume_bytes: 214748364800
+    data_mount: /srv/data
+
+    # auto reads /etc/os-release. Or force: al2023, ubuntu.
+    linux_os: auto
+
+    # Who may sign in, by GitHub login. Public keys come from github.com/<login>.keys, so
+    # nobody pastes a key into a file. The docker group is root-equivalent on the host;
+    # keep this list short. There is no sudo: operations go through SSM.
+    workspace_users: []
+    #  - { name: alice, github: alice-example }
+
+    # Join a tailnet (Tailscale or Headscale). Off by default.
+    tailnet_enabled: false
+    tailnet_login_server: ''
+    tailnet_authkey_ssm_path: ''
+    tailnet_region: us-east-1
+
+    # Idle stop. A machine nobody is using does not look idle, and CPU is not the signal:
+    # it stops when nobody is connected AND no unit of work is in flight. The gate is the
+    # work. If busy_check_cmd cannot run, the answer is "busy".
+    idle_stop_armed: false
+    idle_stop_minutes: 30
+    busy_check_cmd: docker ps -q --filter label=com.docker.compose.service=lab
+
+  tasks:
+    - name: Set the hostname
+      ansible.builtin.hostname:
+        name: '{{ hostname }}'
+
+    # ---- the operating system --------------------------------------------------------
+
+    - name: Read the operating system
+      ansible.builtin.shell: . /etc/os-release && echo "$ID"
+      register: os_release
+      changed_when: false
+      when: linux_os == 'auto'
+
+    # amzn is Amazon Linux. Anything else is refused: a furnish that guesses an OS installs
+    # the wrong packages and reports success.
+    - name: Resolve the operating system
+      ansible.builtin.set_fact:
+        os_key: >-
+          {{ linux_os if linux_os != 'auto'
+             else ('al2023' if os_release.stdout | trim == 'amzn'
+                   else ('ubuntu' if os_release.stdout | trim == 'ubuntu' else 'unsupported')) }}
+
+    - name: Stop on an operating system this playbook does not furnish
+      ansible.builtin.fail:
+        msg: >-
+          Unsupported operating system ({{ os_release.stdout | default(linux_os) | trim }}).
+          This playbook furnishes Amazon Linux 2023 (al2023) and Ubuntu (ubuntu).
+      when: os_key not in ['al2023', 'ubuntu']
+
+    - name: Load the operating system's variables
+      ansible.builtin.include_vars: 'vars/{{ os_key }}.yml'
+
+    # Packages, Docker's plugins and the Tailscale repository: the parts that differ.
+    - name: Install packages, Docker and Tailscale
+      ansible.builtin.include_tasks: 'tasks/{{ os_key }}.yml'
+
+    # ---- data volume -----------------------------------------------------------------
+
+    - name: Find the data volume
+      ansible.builtin.shell: |
+        lsblk -bndo NAME,SIZE,TYPE | awk '$3=="disk" && $2=={{ data_volume_bytes }} {print "/dev/"$1}'
+      register: data_device
+      changed_when: false
+
+    - name: Stop if the data volume is not attached
+      ansible.builtin.fail:
+        msg: No {{ data_volume_bytes }}-byte disk found. Check the attachment and data_volume_bytes.
+      when: data_device.stdout | trim == ''
+
+    - name: Format the data volume
+      community.general.filesystem:
+        fstype: ext4
+        dev: '{{ data_device.stdout | trim }}'
+        opts: -L data
+
+    # Mounted by label, so the device name changing across a reboot does not matter.
+    - name: Mount the data volume
+      ansible.posix.mount:
+        path: '{{ data_mount }}'
+        src: LABEL=data
+        fstype: ext4
+        opts: defaults,nofail
+        state: mounted
+
+    - name: Point Docker's data root at the data volume
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          { "data-root": "{{ data_mount }}/docker" }
+        mode: '0644'
+      register: docker_daemon
+
+    - name: Restart Docker onto the new data root
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+        enabled: true
+      when: docker_daemon is changed
+
+    # ---- people ----------------------------------------------------------------------
+
+    - name: Create the accounts
+      ansible.builtin.user:
+        name: '{{ item.name }}'
+        shell: /bin/bash
+        groups: docker
+        append: true
+      loop: '{{ workspace_users }}'
+      loop_control: { label: '{{ item.name }}' }
+
+    - name: Authorize their GitHub keys
+      ansible.posix.authorized_key:
+        user: '{{ item.name }}'
+        key: 'https://github.com/{{ item.github }}.keys'
+        exclusive: true
+      loop: '{{ workspace_users }}'
+      loop_control: { label: '{{ item.name }}' }
+
+    - name: Harden sshd
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/99-furnish.conf
+        content: |
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          AllowGroups {{ login_group }} {{ workspace_users | map(attribute='name') | join(' ') }}
+        mode: '0644'
+        validate: sshd -t -f %s
+      register: sshd_conf
+
+    - name: Reload sshd
+      ansible.builtin.systemd:
+        name: '{{ ssh_service }}'
+        state: reloaded
+      when: sshd_conf is changed
+
+    # ---- tailnet ---------------------------------------------------------------------
+
+    # Tailscale itself is installed from the operating system's signed repository by
+    # tasks/<os>.yml above.
+
+    - name: Read the tailnet state
+      ansible.builtin.shell: tailscale status --json | jq -r '"\(.Self.HostName) \(.BackendState)"'
+      register: tailnet_state
+      changed_when: false
+      failed_when: false
+      when: tailnet_enabled | bool
+
+    # Scrub the key from the output rather than using no_log, which would hide the real
+    # failure behind "censored".
+    - name: Join the tailnet
+      ansible.builtin.shell: |
+        key=$(aws ssm get-parameter --name '{{ tailnet_authkey_ssm_path }}' \
+          --with-decryption --query Parameter.Value --output text --region {{ tailnet_region }})
+        [ -n "$key" ] || { echo 'no pre-auth key at {{ tailnet_authkey_ssm_path }}'; exit 1; }
+        out=$(tailscale up --login-server '{{ tailnet_login_server }}' --authkey "$key" \
+          --hostname '{{ hostname }}' 2>&1) ; code=$?
+        printf '%s\n' "${out//$key/<key>}"
+        exit $code
+      args:
+        executable: /bin/bash
+      changed_when: true
+      when: tailnet_enabled | bool and 'Running' not in tailnet_state.stdout
+
+    - name: Read back the tailnet state
+      ansible.builtin.shell: tailscale status --json | jq -r '"\(.Self.HostName) \(.BackendState)"'
+      register: tailnet_after
+      changed_when: false
+      when: tailnet_enabled | bool
+
+    # With no inbound access, an unjoined machine is unreachable, not degraded.
+    - name: Stop if the machine is not on the tailnet
+      ansible.builtin.fail:
+        msg: >-
+          Not on the tailnet ({{ tailnet_after.stdout | trim }}). Check the key at
+          {{ tailnet_authkey_ssm_path }}, that the ACL knows its tag, and that no older
+          node still holds the name {{ hostname }} (the join then registers as {{ hostname }}-1).
+      when: tailnet_enabled | bool and 'Running' not in tailnet_after.stdout
+
+    # ---- idle stop -------------------------------------------------------------------
+
+    - name: Install the idle-stop check
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/idle-stop
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Stop this instance after {{ idle_stop_minutes }} minutes with no SSH session and no work in flight.
+          set -u
+          STATE=/run/idle-stop.count
+          LIMIT={{ (idle_stop_minutes / 5) | int }}
+          GRACE=1800   # a start and the first login take a while; never stop inside this
+          up=$(cut -d. -f1 /proc/uptime)
+          ssh=$(ss -Htn state established '( sport = :22 )' | wc -l)
+          # The gate is the work, not the daemon. Only the unit of work counts; the
+          # services that stay up between runs must not. If the check cannot run, that is
+          # not "no work": count it as busy.
+          if out=$({{ busy_check_cmd }} 2>/dev/null); then
+            work=$(printf '%s' "$out" | grep -c .)
+          else
+            work=1
+          fi
+          if [ "$up" -lt "$GRACE" ] || [ "$ssh" -gt 0 ] || [ "$work" -gt 0 ]; then
+            echo 0 > "$STATE"
+            logger -t idle-stop "busy uptime=${up}s ssh=${ssh} work=${work}"
+            exit 0
+          fi
+          n=$(( $(cat "$STATE" 2>/dev/null || echo 0) + 1 ))
+          echo "$n" > "$STATE"
+          if [ ! -f /etc/idle-stop-armed ]; then
+            logger -t idle-stop "idle ${n}/${LIMIT}, disarmed: not stopping"
+            exit 0
+          fi
+          logger -t idle-stop "idle ${n}/${LIMIT}"
+          if [ "$n" -ge "$LIMIT" ]; then
+            logger -t idle-stop "stopping the instance"
+            systemctl poweroff   # the instance's shutdown behavior must be "stop"
+          fi
+
+    - name: Install the idle-stop service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/idle-stop.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Stop the instance when nobody is using it
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/idle-stop
+
+    - name: Install the idle-stop timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/idle-stop.timer
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Check every 5 minutes whether the instance is idle
+
+          [Timer]
+          OnBootSec=5min
+          OnUnitActiveSec=5min
+          AccuracySec=30s
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Arm or disarm the idle stop
+      ansible.builtin.file:
+        path: /etc/idle-stop-armed
+        state: '{{ "touch" if idle_stop_armed else "absent" }}'
+        mode: '0644'
+
+    - name: Enable the idle-stop timer
+      ansible.builtin.systemd:
+        name: idle-stop.timer
+        state: started
+        enabled: true
+        daemon_reload: true

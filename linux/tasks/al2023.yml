@@ -1,0 +1,54 @@
+---
+# Amazon Linux 2023. The SSM agent, the AWS CLI v2 and curl (as curl-minimal) ship in the
+# image. Naming curl in a package list would conflict with curl-minimal.
+- name: Install the base packages
+  ansible.builtin.dnf:
+    name: [docker, git, jq, bc, tmux]
+    state: present
+
+# Amazon Linux packages Docker but not the Compose or Buildx plugins.
+- name: Create the Docker CLI plugin directory
+  ansible.builtin.file:
+    path: /usr/local/lib/docker/cli-plugins
+    state: directory
+    mode: '0755'
+
+- name: Install the Compose plugin
+  ansible.builtin.get_url:
+    url: 'https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-linux-x86_64'
+    dest: /usr/local/lib/docker/cli-plugins/docker-compose
+    checksum: 'sha256:{{ docker_compose_sha256 }}'
+    mode: '0755'
+
+- name: Install the Buildx plugin
+  ansible.builtin.get_url:
+    url: 'https://github.com/docker/buildx/releases/download/{{ docker_buildx_version }}/buildx-{{ docker_buildx_version }}.linux-amd64'
+    dest: /usr/local/lib/docker/cli-plugins/docker-buildx
+    checksum: 'sha256:{{ docker_buildx_sha256 }}'
+    mode: '0755'
+
+# Tailscale's signed repository, with package and repository signatures both checked. Not
+# the install script, which pipes a download into a shell.
+- name: Add the Tailscale repository
+  ansible.builtin.yum_repository:
+    name: tailscale-stable
+    description: Tailscale stable
+    baseurl: 'https://pkgs.tailscale.com/stable/amazon-linux/2023/$basearch'
+    gpgcheck: true
+    repo_gpgcheck: true
+    gpgkey: https://pkgs.tailscale.com/stable/amazon-linux/2023/repo.gpg
+    enabled: true
+  when: tailnet_enabled | bool
+
+- name: Install Tailscale
+  ansible.builtin.dnf:
+    name: tailscale
+    state: present
+  when: tailnet_enabled | bool
+
+- name: Run the Tailscale daemon
+  ansible.builtin.systemd:
+    name: tailscaled
+    state: started
+    enabled: true
+  when: tailnet_enabled | bool
