@@ -5,6 +5,13 @@
   ansible.builtin.dnf:
     name: [docker, git, jq, bc, tmux]
     state: present
+    # Inspector and other boot-time agents can hold the RPM database. DNF waits for
+    # its own lock, then Ansible retries in case another transaction wins the race.
+    lock_timeout: 600
+  register: base_packages
+  retries: 3
+  delay: 15
+  until: base_packages is succeeded
 
 # Amazon Linux packages Docker but not the Compose or Buildx plugins.
 - name: Create the Docker CLI plugin directory
@@ -44,6 +51,11 @@
   ansible.builtin.dnf:
     name: tailscale
     state: present
+    lock_timeout: 600
+  register: tailscale_package
+  retries: 3
+  delay: 15
+  until: tailscale_package is succeeded
   when: tailnet_enabled | bool
 
 - name: Run the Tailscale daemon

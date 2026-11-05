@@ -19,6 +19,13 @@
     state: present
     update_cache: true
     cache_valid_time: 3600
+    # Boot-time unattended upgrades / Inspector can own dpkg's fcntl locks. Let apt
+    # wait for the lock itself, then retry if a second process wins the race afterward.
+    lock_timeout: 600
+  register: base_packages
+  retries: 3
+  delay: 15
+  until: base_packages is succeeded
 
 - name: Check whether the AWS CLI is present
   ansible.builtin.command: which aws
@@ -53,6 +60,11 @@
     name: tailscale
     state: present
     update_cache: true
+    lock_timeout: 600
+  register: tailscale_package
+  retries: 3
+  delay: 15
+  until: tailscale_package is succeeded
   when: tailnet_enabled | bool
 
 - name: Run the Tailscale daemon

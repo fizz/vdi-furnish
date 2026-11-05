@@ -68,6 +68,18 @@ Each one cost an afternoon at least once.
 - **Use Tailscale's repository, not the install script.** The Amazon Linux 2023 repo checks
   both package and repository signatures.
 
+## Package-manager locks
+
+- **Do not remove apt/dpkg or RPM lock files, and do not disable Inspector to make a
+  furnish pass.** A boot-time agent can legitimately own the package database while it
+  installs or scans. Use the package manager's own lock timeout, then retry the safe,
+  idempotent install with a delay: a process can acquire the lock after a pre-check.
+  `fuser` can identify an open lock when diagnosing contention; `flock` is not a reliable
+  probe for the fcntl locks used by these package managers.
+- The Linux furnish tasks wait up to ten minutes for apt/dnf's lock and retry the install
+  up to three times. If that still fails, inspect the owning process and its logs rather
+  than killing it or deleting the lock.
+
 ## Certificates
 
 - **On-box ACME needs no static key.** Put the instance role's own ARN in its trust
