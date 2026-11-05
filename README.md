@@ -42,6 +42,33 @@ export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES no_proxy='*'
 ansible-playbook -i windows/inventory.aws_ec2.yml windows/furnish.yml
 ```
 
+## Trusted DCV certificates on Linux
+
+Linux DCV desktops can use the shared `vdi-furnish` certificate role instead of the
+default self-signed certificate. Set `dcv_certificate_enabled: true` and provide the
+hostname, contact email, Route 53 hosted-zone ID, and a narrowly scoped ACME role ARN.
+The playbook uses Certbot's DNS-01 challenge, so the private desktop does not need to
+be reachable from the public internet. The cross-account role should allow TXT changes
+only for `_acme-challenge.<hostname>` and read access to the authoritative zone.
+
+The task installs the certificate and private key at `/etc/dcv/dcv.pem` and
+`/etc/dcv/dcv.key`, with DCV ownership and restrictive permissions. Certbot's renewal
+timer uses the same short-lived instance-profile role and deploy hook. Keep the DNS
+role and the hostname/zone configuration in the infrastructure repository; the
+certificate installation and renewal behavior belongs here in this shared furnishing
+repository. The current task supports Ubuntu 24.04 or newer.
+
+Example variables:
+
+```yaml
+dcv_certificate_enabled: true
+dcv_certificate_hostname: vdi.stage.example.com
+dcv_certificate_email: ops@example.com
+dcv_certificate_route53_zone_id: Z0123456789ABCDEFGHIJ
+dcv_certificate_acme_role_arn: arn:aws:iam::123456789012:role/vdi-dns01-acme
+dcv_certificate_aws_region: us-east-1
+```
+
 A macOS control node can print "worker found in a dead state" and still exit 0, with no
 `PLAY RECAP`. Check for the recap, not the exit code.
 

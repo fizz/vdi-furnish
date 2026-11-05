@@ -1,0 +1,5 @@
+---
+# This repository is also installable as an Ansible role for its reusable Linux DCV
+# certificate task. The public playbooks remain the normal entry points for full hosts.
+- name: Configure a DNS-01 certificate for Linux NICE DCV
+  ansible.builtin.import_tasks: ../linux/tasks/dcv-certificate.yml

@@ -1,0 +1,199 @@
+---
+- name: Require certificate inputs when DCV TLS is enabled
+  ansible.builtin.assert:
+    that:
+      - dcv_certificate_hostname | length > 0
+      - dcv_certificate_email | length > 0
+      - dcv_certificate_route53_zone_id | length > 0
+      - dcv_certificate_acme_role_arn is match('^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+')
+    fail_msg: >-
+      DNS-01 DCV TLS needs a hostname, contact email, Route 53 zone ID, and the
+      cross-account ACME role ARN.
+  when: dcv_certificate_enabled | bool
+
+- name: Gather minimal host facts for the Certbot platform check
+  ansible.builtin.setup:
+    gather_subset: [min]
+  when: dcv_certificate_enabled | bool
+
+- name: Require Ubuntu for the current Certbot package path
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_version is version('24.04', '>=')
+    fail_msg: The reusable DCV DNS-01 task currently supports Ubuntu 24.04 or newer.
+  when: dcv_certificate_enabled | bool
+
+- name: Install Certbot and the Route 53 DNS plugin
+  ansible.builtin.apt:
+    name:
+      - certbot
+      - python3-certbot-dns-route53
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 600
+  register: dcv_certbot_packages
+  retries: 3
+  delay: 15
+  until: dcv_certbot_packages is succeeded
+  when: dcv_certificate_enabled | bool
+
+- name: Create root AWS config directory for the ACME role profile
+  ansible.builtin.file:
+    path: /root/.aws
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  when: dcv_certificate_enabled | bool
+
+- name: Configure short-lived instance-profile credentials for Route 53 DNS-01
+  ansible.builtin.copy:
+    dest: /root/.aws/config
+    owner: root
+    group: root
+    mode: '0600'
+    content: |
+      [profile dcv-acme]
+      role_arn = {{ dcv_certificate_acme_role_arn }}
+      credential_source = Ec2InstanceMetadata
+      region = {{ dcv_certificate_aws_region }}
+  when: dcv_certificate_enabled | bool
+
+- name: Verify the ACME role can read the expected Route 53 zone
+  ansible.builtin.command:
+    argv:
+      - aws
+      - route53
+      - get-hosted-zone
+      - --id
+      - '{{ dcv_certificate_route53_zone_id }}'
+      - --query
+      - HostedZone.Name
+      - --output
+      - text
+  environment:
+    AWS_PROFILE: dcv-acme
+    AWS_DEFAULT_REGION: '{{ dcv_certificate_aws_region }}'
+  register: dcv_certificate_zone
+  changed_when: false
+  when: dcv_certificate_enabled | bool
+
+- name: Confirm the certificate hostname belongs to the configured Route 53 zone
+  ansible.builtin.assert:
+    that:
+      - dcv_certificate_hostname == (dcv_certificate_zone.stdout | trim | regex_replace('\.$', '')) or dcv_certificate_hostname.endswith('.' ~ (dcv_certificate_zone.stdout | trim | regex_replace('\.$', '')))
+    fail_msg: The DNS-01 role can read a zone, but it is not authoritative for the certificate hostname.
+  when: dcv_certificate_enabled | bool
+
+- name: Install DCV certificate deploy hook
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/deploy-dcv-certificate
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/sh
+      set -eu
+      lineage="${1:-}"
+      test -n "$lineage" || { echo 'usage: deploy-dcv-certificate <lineage>' >&2; exit 2; }
+      test -r "$lineage/fullchain.pem" -a -r "$lineage/privkey.pem"
+      install -d -o dcv -g dcv -m 0750 /etc/dcv
+      changed=0
+      for pair in "fullchain.pem dcv.pem" "privkey.pem dcv.key"; do
+        set -- $pair
+        src="$lineage/$1"
+        dst="/etc/dcv/$2"
+        if ! cmp -s "$src" "$dst"; then
+          install -o dcv -g dcv -m 0600 "$src" "$dst"
+          changed=1
+        fi
+      done
+      if [ "$changed" -eq 1 ]; then echo updated; else echo unchanged; fi
+  when: dcv_certificate_enabled | bool
+
+- name: Create the Certbot deploy-hook directory
+  ansible.builtin.file:
+    path: /etc/letsencrypt/renewal-hooks/deploy
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: dcv_certificate_enabled | bool
+
+- name: Deploy renewed DCV certificates automatically
+  ansible.builtin.copy:
+    dest: /etc/letsencrypt/renewal-hooks/deploy/20-dcv-certificate
+    owner: root
+    group: root
+    mode: '0750'
+    content: |
+      #!/bin/sh
+      set -eu
+      case " ${RENEWED_DOMAINS:-} " in
+        *" {{ dcv_certificate_hostname }} "*) exec /usr/local/sbin/deploy-dcv-certificate "${RENEWED_LINEAGE:?}" ;;
+        *) exit 0 ;;
+      esac
+  when: dcv_certificate_enabled | bool
+
+- name: Create a systemd drop-in so scheduled renewals use the ACME role profile
+  ansible.builtin.file:
+    path: /etc/systemd/system/certbot.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  when: dcv_certificate_enabled | bool
+
+- name: Configure the Certbot service environment for renewals
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/certbot.service.d/10-dcv-acme.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Service]
+      Environment=AWS_PROFILE=dcv-acme
+      Environment=AWS_DEFAULT_REGION={{ dcv_certificate_aws_region }}
+  when: dcv_certificate_enabled | bool
+
+- name: Issue the initial certificate with DNS-01
+  ansible.builtin.command:
+    argv:
+      - certbot
+      - certonly
+      - --non-interactive
+      - --agree-tos
+      - --email
+      - '{{ dcv_certificate_email }}'
+      - --dns-route53
+      - --dns-route53-propagation-seconds
+      - '{{ dcv_certificate_propagation_seconds | string }}'
+      - --cert-name
+      - '{{ dcv_certificate_hostname }}'
+      - --domains
+      - '{{ dcv_certificate_hostname }}'
+  environment:
+    AWS_PROFILE: dcv-acme
+    AWS_DEFAULT_REGION: '{{ dcv_certificate_aws_region }}'
+  args:
+    creates: '/etc/letsencrypt/live/{{ dcv_certificate_hostname }}/fullchain.pem'
+  when: dcv_certificate_enabled | bool
+
+- name: Install the initial certificate into the Linux DCV certificate paths
+  ansible.builtin.command:
+    argv:
+      - /usr/local/sbin/deploy-dcv-certificate
+      - '/etc/letsencrypt/live/{{ dcv_certificate_hostname }}'
+  register: dcv_certificate_deploy
+  changed_when: "'updated' in dcv_certificate_deploy.stdout"
+  when: dcv_certificate_enabled | bool
+
+- name: Enable Certbot's automatic renewal timer
+  ansible.builtin.systemd:
+    name: certbot.timer
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: dcv_certificate_enabled | bool

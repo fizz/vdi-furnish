@@ -40,6 +40,16 @@
     tailnet_authkey_ssm_path: ''
     tailnet_region: us-east-1
 
+    # Optional DNS-01 certificate for a Linux NICE DCV server. The cross-account role
+    # must be limited to this hostname's _acme-challenge TXT record.
+    dcv_certificate_enabled: false
+    dcv_certificate_hostname: ''
+    dcv_certificate_email: ''
+    dcv_certificate_route53_zone_id: ''
+    dcv_certificate_acme_role_arn: ''
+    dcv_certificate_aws_region: us-east-1
+    dcv_certificate_propagation_seconds: 30
+
     # Idle stop. A machine nobody is using does not look idle, and CPU is not the signal:
     # it stops when nobody is connected AND no unit of work is in flight. The gate is the
     # work. If busy_check_cmd cannot run, the answer is "busy".
@@ -82,6 +92,10 @@
     # Packages, Docker's plugins and the Tailscale repository: the parts that differ.
     - name: Install packages, Docker and Tailscale
       ansible.builtin.include_tasks: 'tasks/{{ os_key }}.yml'
+
+    - name: Configure Linux DCV TLS with Route 53 DNS-01
+      ansible.builtin.include_tasks: tasks/dcv-certificate.yml
+      when: dcv_certificate_enabled | bool
 
     # ---- data volume -----------------------------------------------------------------
 

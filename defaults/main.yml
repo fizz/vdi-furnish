@@ -1,0 +1,8 @@
+---
+dcv_certificate_enabled: false
+dcv_certificate_hostname: ''
+dcv_certificate_email: ''
+dcv_certificate_route53_zone_id: ''
+dcv_certificate_acme_role_arn: ''
+dcv_certificate_aws_region: us-east-1
+dcv_certificate_propagation_seconds: 30
